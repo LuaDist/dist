@@ -1,0 +1,127 @@
+#!/usr/bin/lua
+
+require 'lfs'
+
+-- Path to where packages are located
+REPO = 'git://github.com/LuaDist/%s.git'
+
+-- Path to where packages are cloned and built in
+PACKAGE_STORE = 'packages'
+
+-- List of packages (e.g. loaded from dist manifest)
+PACKAGES = {
+    colors = true,
+    md5 = true,
+--  ...
+}
+
+function git(...)
+    local args = {...}
+    table.insert(args, 1, 'git')
+    local cmd = table.concat(args, ' ')
+    print('Git', cmd)
+    return os.execute(cmd)
+end
+
+function write(file, ...)
+    local f = assert(io.open(file, 'w'))
+    f:write(...)
+    f:close()
+end
+
+function append(file, ...)
+    local f = assert(io.open(file, 'a'))
+    f:write(...)
+    f:close()
+end
+
+-- Check, whether the current directory has a repo. If not, creates the
+-- PACKAGE_STORE directory and sets up the deployment repo.
+if not lfs.attributes('.git') then
+    git "init -q"
+    lfs.mkdir(PACKAGE_STORE)
+    write('.gitignore', PACKAGE_STORE, '\n')
+    git "add ."
+    git "commit -q -m 'Versioning started'"
+end
+
+-- Commits using `comment` and creates the tag `tagname`
+function createTag(comment, tagname)
+    git("commit -q -m", ('%q'):format(comment))
+    git("tag", tagname)
+end
+
+function execute(cmd)
+    print(lfs.currentdir(), cmd)
+    return os.execute(cmd)
+end
+
+-- Clones a package from the REPO, stores it in PACKAGE_STORE and creates
+-- directories PACKAGE_STORE/package.build (CMake build files) and
+-- PACKAGE_STORE/package.install, which contains installed files.
+-- Then creates a temporary git repo from PACKAGE_STORE/package.install, and
+-- returns the path to it.
+function buildPackage(package)
+    local curr = lfs.currentdir()
+    assert(lfs.chdir(PACKAGE_STORE))
+    git("clone", REPO:format(package))
+
+    -- TODO: make up better paths
+    local installpath = package..'.install'
+    assert(lfs.mkdir(installpath))
+    assert(lfs.chdir(installpath))
+    installpath = lfs.currentdir()
+    assert(lfs.chdir(".."))
+
+    local buildpath = package..'.build'
+    assert(lfs.mkdir(buildpath))
+    assert(lfs.chdir(buildpath))
+    buildpath = lfs.currentdir()
+
+    execute(("cmake -DCMAKE_INSTALL_PREFIX=%q ../%s"):format(installpath, package))
+    execute("make install")
+
+    lfs.chdir(installpath)
+    git "init -q" 
+    git "add ."
+    git(("commit -m 'Built %s'"):format(package))
+
+    lfs.chdir(curr)
+    return installpath
+end
+
+-- Creates a remote to a repo, fetches master and merges it to deployment
+function installPackage(package, fromRepo)
+    git("remote add", package, fromRepo)
+    git("fetch", package)
+    git("merge --no-commit", ("%s/master"):format(package))
+end
+
+local command = arg[1]
+if command == 'install' then
+    local package = arg[2]
+    assert(package, "Usage: gitdist install package")
+    assert(PACKAGES[package], "Package " .. package .. " does not exist")
+
+    -- TODO: look up if the package is already built
+    local tempRepo = buildPackage(package)
+    installPackage(package, tempRepo)
+
+    createTag("Installed "..package, package)
+elseif command == 'uninstall' then
+    local package = arg[2]
+    assert(package, "Usage: gitdist uninstall package")
+    assert(PACKAGES[package], "Package " .. package .. " does not exist")
+
+    -- looks up if there is a tag named the same as package
+    -- return code 0 = ok, 1 = error
+    local installed = git("show-ref -q", package)
+    print(package, installed)
+    assert(installed == 0, "package is not installed")
+
+    -- revert to parent 1 (the mainline, packages are always parent 2)
+    git("revert -m 1 --no-commit", package)
+    git(("commit -m 'Uninstalled %s'"):format(package))
+elseif command =='clean' then
+    os.execute('rm -rf .git .gitignore packages share')
+end
